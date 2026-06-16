@@ -1275,7 +1275,7 @@ function saveLocal(){
   catch(e){ /* storage unavailable (private mode, or sandboxed preview): keep working in-memory */ }
   renderStats();
 }
-function save(){ saveLocal(); pushGrocery(); pushPlan(); }  /* push* no-op until the household is synced */
+function save(){ saveLocal(); pushGrocery(); pushPlan(); pushRecipes(); }  /* push* no-op until the household is synced */
 
 
 /* ================= navigation ================= */
@@ -2294,7 +2294,7 @@ const FB_CONFIG = {
   appId: '1:803730622999:web:7dd715d69b824aa6996a52'
 };
 const HOUSEHOLD_ID = 'chez-nous';
-const cloud = { available:false, uid:null, connected:false, authorized:null, auth:null, db:null, groceryRef:null, lastGrocery:null, planRef:null, lastPlan:null, syncStarted:false };
+const cloud = { available:false, uid:null, connected:false, authorized:null, auth:null, db:null, groceryRef:null, lastGrocery:null, planRef:null, lastPlan:null, recipesRef:null, lastRecipes:null, syncStarted:false };
 
 /* ---- grocery sync (slice 1) — pure transforms, no Firebase needed (unit-tested) ----
    RTDB has no arrays, so a household's grocery lives as an id-keyed object
@@ -2365,6 +2365,7 @@ function startGrocerySync(){
       cloud.groceryRef.on('child_changed', s => applyRemoteG(s.key, s.val()));
       cloud.groceryRef.on('child_removed', s => removeRemoteG(s.key));
       startPlanSync();   /* chain plan sync once the household read is authorized */
+      startRecipeSync();
     }, err => { cloud.authorized = false; renderSync(); });   /* permission denied → not a member; stay local-only */
   } catch(e){ cloud.authorized = false; renderSync(); }
 }
@@ -2462,6 +2463,88 @@ function startPlanSync(){
       cloud.planRef.on('child_added',   s => applyRemotePlanDate(s.key, s.val()));
       cloud.planRef.on('child_changed', s => applyRemotePlanDate(s.key, s.val()));
       cloud.planRef.on('child_removed', s => removeRemotePlanDate(s.key));
+    }, err => {});
+  } catch(e){}
+}
+
+/* ---- recipe sync (slice 3) — recipe is the unit, same pattern as grocery ----
+   No arbitrary-keyed sub-maps (ingredients/steps/groups are arrays), so no key
+   escaping. Seed recipes use stable ids, so the starter set merges without
+   duplicating. Applying a remote recipe re-renders the week too, so a planned
+   dish picks up its real title the moment its recipe arrives. */
+function rSerIng(i){ const o = { name: i.name || '', qty: (i.qty === '' || i.qty == null ? '' : i.qty), unit: i.unit || '' }; if (i.group != null) o.group = i.group; return o; }
+function rSerGroup(g){ return { id: g.id, label: g.label || '', boughtDefault: !!g.boughtDefault, boughtName: g.boughtName || '' }; }
+function rSerialize(r){
+  return {
+    title: r.title || '', glyph: r.glyph || '', art: r.art || '', category: r.category || '',
+    time: (typeof r.time === 'number' ? r.time : 0), servings: (typeof r.servings === 'number' ? r.servings : 0),
+    fav: !!r.fav, note: r.note || '', source: r.source || '',
+    ingredients: (r.ingredients || []).map(rSerIng),
+    steps: (r.steps || []).slice(),
+    stepGroups: (r.stepGroups || []).slice(),
+    groups: (r.groups || []).map(rSerGroup),
+    by: (r.by != null ? r.by : null)
+  };
+}
+function rDeserialize(id, v){
+  v = v || {};
+  return {
+    id: id, title: v.title || '', glyph: v.glyph || '', art: v.art || '', category: v.category || '',
+    time: (typeof v.time === 'number' ? v.time : 0), servings: (typeof v.servings === 'number' ? v.servings : 0),
+    fav: !!v.fav, note: v.note || '', source: v.source || '',
+    ingredients: (v.ingredients || []).map(rSerIng),
+    steps: (v.steps || []).slice(),
+    stepGroups: (v.stepGroups || []).slice(),
+    groups: (v.groups || []).map(rSerGroup),
+    by: (v.by != null ? v.by : null)
+  };
+}
+function rCanon(v){ return rSerialize(rDeserialize('_', v)); }
+function rMap(arr){ const m = {}; for (const r of arr) m[r.id] = rSerialize(r); return m; }
+function rReconcile(localArr, remoteMap){
+  const merged = {}, toPush = {};
+  for (const id in remoteMap) merged[id] = rDeserialize(id, remoteMap[id]);          /* remote wins on a shared id */
+  for (const r of localArr){ if (!(r.id in merged)){ merged[r.id] = r; toPush[r.id] = rSerialize(r); } }
+  return { items: Object.values(merged), toPush: toPush };
+}
+function renderRecipeViews(){ renderChips(); renderRecipes(); renderWeek(); }   /* week too: planned dishes show real titles once recipes arrive */
+function pushRecipes(){
+  if (!cloud.available || !cloud.authorized || !cloud.recipesRef) return;
+  try {
+    const cur = rMap(state.recipes);
+    const up = gDiff(cloud.lastRecipes || {}, cur);
+    if (Object.keys(up).length) cloud.recipesRef.update(up).catch(() => {});
+    cloud.lastRecipes = cur;
+  } catch(e){}
+}
+function applyRemoteR(id, val){
+  const canon = rCanon(val);
+  if (cloud.lastRecipes && cloud.lastRecipes[id] && gEqual(cloud.lastRecipes[id], canon)) return;  /* our own write echoing back */
+  const item = rDeserialize(id, val);
+  const i = state.recipes.findIndex(r => r.id === id);
+  if (i >= 0) state.recipes[i] = item; else state.recipes.unshift(item);
+  (cloud.lastRecipes = cloud.lastRecipes || {})[id] = canon;
+  saveLocal(); renderRecipeViews();
+}
+function removeRemoteR(id){
+  if (!state.recipes.some(r => r.id === id)){ if (cloud.lastRecipes) delete cloud.lastRecipes[id]; return; }
+  state.recipes = state.recipes.filter(r => r.id !== id);
+  if (cloud.lastRecipes) delete cloud.lastRecipes[id];
+  saveLocal(); renderRecipeViews();
+}
+function startRecipeSync(){
+  try {
+    cloud.recipesRef = cloud.db.ref('cnv2/households/' + HOUSEHOLD_ID + '/recipes');
+    cloud.recipesRef.once('value', snap => {
+      const remoteMap = snap.val() || {};
+      const rec = rReconcile(state.recipes, remoteMap);
+      state.recipes = rec.items;
+      cloud.lastRecipes = rMap(state.recipes);
+      if (Object.keys(rec.toPush).length) cloud.recipesRef.update(rec.toPush).catch(() => {});
+      saveLocal(); renderRecipeViews();
+      cloud.recipesRef.on('child_added',   s => applyRemoteR(s.key, s.val()));
+      cloud.recipesRef.on('child_changed', s => applyRemoteR(s.key, s.val()));
+      cloud.recipesRef.on('child_removed', s => removeRemoteR(s.key));
     }, err => {});
   } catch(e){}
 }
