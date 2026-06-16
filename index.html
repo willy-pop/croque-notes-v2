@@ -1270,11 +1270,12 @@ function migrate(s){
   s.grocery.forEach(g => { if (!('by' in g)) g.by = null; });
   s.v = 2;
 }
-function save(){
+function saveLocal(){
   try { localStorage.setItem(KEY, JSON.stringify(state)); }
   catch(e){ /* storage unavailable (private mode, or sandboxed preview): keep working in-memory */ }
   renderStats();
 }
+function save(){ saveLocal(); pushGrocery(); pushPlan(); }  /* push* no-op until the household is synced */
 
 
 /* ================= navigation ================= */
@@ -1853,7 +1854,7 @@ function dishHTML(key, meal, d, idx){
   }).join('') + '</div>' : '';
   return '<div class="dish" data-key="' + key + '" data-meal="' + meal + '" data-idx="' + idx + '" role="button" tabindex="0">' +
     '<span class="dglyph ' + (r ? '' : 'note') + '">' + icon(r ? r.glyph : 'note') + '</span>' +
-    '<span class="dtxt"><b>' + esc(r ? r.title : d.text) + '</b>' + (r ? '<small>' + esc(r.category) + ' · ' + fmtTime(r.time) + '</small>' : '<small>Texte libre</small>') + pills + '</span>' +
+    '<span class="dtxt"><b>' + esc(r ? r.title : (d.text != null ? d.text : 'Recette non synchronisée')) + '</b>' + (r ? '<small>' + esc(r.category) + ' · ' + fmtTime(r.time) + '</small>' : '<small>' + (d.text != null ? 'Texte libre' : 'En attente de synchro') + '</small>') + pills + '</span>' +
     '<button class="dx" aria-label="Retirer ce plat">' + icon('x') + '</button>' +
     '</div>';
 }
@@ -2292,7 +2293,178 @@ const FB_CONFIG = {
   messagingSenderId: '803730622999',
   appId: '1:803730622999:web:7dd715d69b824aa6996a52'
 };
-const cloud = { available: false, uid: null, connected: false, auth: null, db: null };
+const HOUSEHOLD_ID = 'chez-nous';
+const cloud = { available:false, uid:null, connected:false, authorized:null, auth:null, db:null, groceryRef:null, lastGrocery:null, planRef:null, lastPlan:null, syncStarted:false };
+
+/* ---- grocery sync (slice 1) — pure transforms, no Firebase needed (unit-tested) ----
+   RTDB has no arrays, so a household's grocery lives as an id-keyed object
+   { itemId:{name,qty,unit,aisle,checked,by?} }. We convert only at this boundary;
+   state.grocery stays the same array the rest of the app already uses. */
+function gSerialize(it){
+  const o = { name: it.name, qty: (it.qty === '' || it.qty == null ? '' : it.qty), unit: it.unit || '', aisle: it.aisle || '', checked: !!it.checked };
+  if (it.by != null) o.by = it.by;                 /* null is dropped by RTDB anyway; re-added on read */
+  return o;
+}
+function gDeserialize(id, v){
+  v = v || {};
+  return { id: id, name: v.name || '', qty: (typeof v.qty === 'number' ? v.qty : ''), unit: v.unit || '', aisle: v.aisle || '', checked: !!v.checked, by: (v.by != null ? v.by : null) };
+}
+function gCanon(v){ return gSerialize(gDeserialize('_', v)); }   /* canonical key order for stable compare */
+function gMap(arr){ const m = {}; for (const it of arr) m[it.id] = gSerialize(it); return m; }
+function gEqual(a, b){ return JSON.stringify(a) === JSON.stringify(b); }
+function gDiff(prev, cur){
+  const up = {};
+  for (const id in cur){ if (!prev[id] || !gEqual(prev[id], cur[id])) up[id] = cur[id]; }
+  for (const id in prev){ if (!(id in cur)) up[id] = null; }     /* null removes the node */
+  return up;
+}
+function gReconcile(localArr, remoteMap){
+  const merged = {}, toPush = {};
+  for (const id in remoteMap) merged[id] = gDeserialize(id, remoteMap[id]);          /* remote wins on conflict */
+  for (const it of localArr){ if (!(it.id in merged)){ merged[it.id] = it; toPush[it.id] = gSerialize(it); } }
+  return { items: Object.values(merged), toPush: toPush };
+}
+
+/* ---- grocery sync — Firebase wiring (guarded; no-ops with no SDK / not yet authorized) ---- */
+function pushGrocery(){
+  if (!cloud.available || !cloud.authorized || !cloud.groceryRef) return;
+  try {
+    const cur = gMap(state.grocery);
+    const up = gDiff(cloud.lastGrocery || {}, cur);
+    if (Object.keys(up).length) cloud.groceryRef.update(up).catch(() => {});   /* small diff; offline → queued, applied on reconnect */
+    cloud.lastGrocery = cur;
+  } catch(e){}
+}
+function applyRemoteG(id, val){
+  const canon = gCanon(val);
+  if (cloud.lastGrocery && cloud.lastGrocery[id] && gEqual(cloud.lastGrocery[id], canon)) return;  /* our own write echoing back — ignore */
+  const item = gDeserialize(id, val);
+  const i = state.grocery.findIndex(g => g.id === id);
+  if (i >= 0) state.grocery[i] = item; else state.grocery.push(item);
+  (cloud.lastGrocery = cloud.lastGrocery || {})[id] = canon;
+  saveLocal(); renderGrocery();
+}
+function removeRemoteG(id){
+  if (!state.grocery.some(g => g.id === id)){ if (cloud.lastGrocery) delete cloud.lastGrocery[id]; return; }
+  state.grocery = state.grocery.filter(g => g.id !== id);
+  if (cloud.lastGrocery) delete cloud.lastGrocery[id];
+  saveLocal(); renderGrocery();
+}
+function startGrocerySync(){
+  try {
+    cloud.groceryRef = cloud.db.ref('cnv2/households/' + HOUSEHOLD_ID + '/grocery');
+    cloud.groceryRef.once('value', snap => {
+      cloud.authorized = true;
+      const remoteMap = snap.val() || {};
+      const rec = gReconcile(state.grocery, remoteMap);
+      state.grocery = rec.items;
+      cloud.lastGrocery = {}; for (const it of state.grocery) cloud.lastGrocery[it.id] = gSerialize(it);
+      if (Object.keys(rec.toPush).length) cloud.groceryRef.update(rec.toPush).catch(() => {});  /* push items added locally/offline */
+      saveLocal(); renderGrocery(); renderSync();
+      cloud.groceryRef.on('child_added',   s => applyRemoteG(s.key, s.val()));
+      cloud.groceryRef.on('child_changed', s => applyRemoteG(s.key, s.val()));
+      cloud.groceryRef.on('child_removed', s => removeRemoteG(s.key));
+      startPlanSync();   /* chain plan sync once the household read is authorized */
+    }, err => { cloud.authorized = false; renderSync(); });   /* permission denied → not a member; stay local-only */
+  } catch(e){ cloud.authorized = false; renderSync(); }
+}
+
+/* ---- plan sync (slice 2) — same proven pattern as grocery ----
+   plan = { 'YYYY-MM-DD': { midi:{dishes:[...]}, soir:{dishes:[...]} } }, dish =
+   {recipeId}|{text} with an optional per-instance bought map {groupId:bool}. The
+   bought keys are human sub-recipe labels, which can hold characters RTDB forbids
+   in keys (. / # $ [ ]) — so we escape them at this boundary and unescape on read.
+   Sync unit is the (date, slot): writes use 'date/slot' path keys so editing one
+   meal never clobbers the other. */
+function escKey(k){ return String(k).replace(/[%.$#\[\]\/]/g, c => '%' + c.charCodeAt(0).toString(16).padStart(2,'0')); }
+function unescKey(k){ return String(k).replace(/%([0-9a-f]{2})/gi, (_, h) => String.fromCharCode(parseInt(h,16))); }
+function serDish(d){
+  const o = {};
+  if (d.recipeId != null) o.recipeId = d.recipeId;
+  if (d.text != null) o.text = d.text;
+  if (d.bought){
+    const ks = Object.keys(d.bought).sort();                    /* sorted → stable echo-compare */
+    if (ks.length){ const b = {}; for (const k of ks) b[escKey(k)] = !!d.bought[k]; o.bought = b; }
+  }
+  return o;
+}
+function deserDish(o){
+  o = o || {}; const d = {};
+  if (o.recipeId != null) d.recipeId = o.recipeId;
+  if (o.text != null) d.text = o.text;
+  if (o.bought){ d.bought = {}; for (const k in o.bought) d.bought[unescKey(k)] = !!o.bought[k]; }
+  return d;
+}
+function serSlot(s){ return { dishes: ((s && s.dishes) || []).map(serDish) }; }
+function deserSlot(o){ return { dishes: ((o && o.dishes) || []).map(deserDish) }; }
+function planFlat(plan){
+  const m = {};
+  for (const dateKey in plan){
+    for (const slot of ['midi','soir']){
+      const s = plan[dateKey] && plan[dateKey][slot];
+      if (s && s.dishes && s.dishes.length) m[dateKey + '/' + slot] = serSlot(s);
+    }
+  }
+  return m;
+}
+function planReconcile(localPlan, remoteFlat){
+  const merged = {}, toPush = {};
+  for (const k in remoteFlat){ const p = k.split('/'); (merged[p[0]] = merged[p[0]] || {})[p[1]] = deserSlot(remoteFlat[k]); }  /* remote wins */
+  const localFlat = planFlat(localPlan);
+  for (const k in localFlat){ if (!(k in remoteFlat)){ const p = k.split('/'); (merged[p[0]] = merged[p[0]] || {})[p[1]] = deserSlot(localFlat[k]); toPush[k] = localFlat[k]; } }
+  return { plan: merged, toPush: toPush };
+}
+function pushPlan(){
+  if (!cloud.available || !cloud.authorized || !cloud.planRef) return;
+  try {
+    const cur = planFlat(state.plan);
+    const up = gDiff(cloud.lastPlan || {}, cur);                 /* same diff as grocery; keys are 'date/slot' paths */
+    if (Object.keys(up).length) cloud.planRef.update(up).catch(() => {});
+    cloud.lastPlan = cur;
+  } catch(e){}
+}
+function applyRemotePlanDate(dateKey, val){
+  const remoteSlots = {}, newDate = {};
+  for (const slot of ['midi','soir']){
+    if (val && val[slot] && val[slot].dishes){ remoteSlots[dateKey + '/' + slot] = serSlot(deserSlot(val[slot])); newDate[slot] = deserSlot(val[slot]); }
+  }
+  let changed = false;
+  for (const k in remoteSlots){ if (!cloud.lastPlan || !cloud.lastPlan[k] || !gEqual(cloud.lastPlan[k], remoteSlots[k])) changed = true; }
+  if (cloud.lastPlan) for (const k in cloud.lastPlan){ if (k.indexOf(dateKey + '/') === 0 && !(k in remoteSlots)) changed = true; }
+  if (!changed) return;                                          /* our own write echoing back */
+  if (Object.keys(newDate).length) state.plan[dateKey] = newDate; else delete state.plan[dateKey];
+  cloud.lastPlan = cloud.lastPlan || {};
+  for (const k in cloud.lastPlan){ if (k.indexOf(dateKey + '/') === 0) delete cloud.lastPlan[k]; }
+  for (const k in remoteSlots) cloud.lastPlan[k] = remoteSlots[k];
+  saveLocal(); renderWeek();
+}
+function removeRemotePlanDate(dateKey){
+  const had = !!state.plan[dateKey];
+  if (had) delete state.plan[dateKey];
+  if (cloud.lastPlan) for (const k in cloud.lastPlan){ if (k.indexOf(dateKey + '/') === 0) delete cloud.lastPlan[k]; }
+  if (had){ saveLocal(); renderWeek(); }
+}
+function startPlanSync(){
+  try {
+    cloud.planRef = cloud.db.ref('cnv2/households/' + HOUSEHOLD_ID + '/plan');
+    cloud.planRef.once('value', snap => {
+      const remote = snap.val() || {}, remoteFlat = {};
+      for (const dateKey in remote){
+        for (const slot of ['midi','soir']){
+          if (remote[dateKey] && remote[dateKey][slot] && remote[dateKey][slot].dishes) remoteFlat[dateKey + '/' + slot] = serSlot(deserSlot(remote[dateKey][slot]));
+        }
+      }
+      const rec = planReconcile(state.plan, remoteFlat);
+      state.plan = rec.plan;
+      cloud.lastPlan = planFlat(state.plan);
+      if (Object.keys(rec.toPush).length) cloud.planRef.update(rec.toPush).catch(() => {});
+      saveLocal(); renderWeek();
+      cloud.planRef.on('child_added',   s => applyRemotePlanDate(s.key, s.val()));
+      cloud.planRef.on('child_changed', s => applyRemotePlanDate(s.key, s.val()));
+      cloud.planRef.on('child_removed', s => removeRemotePlanDate(s.key));
+    }, err => {});
+  } catch(e){}
+}
 function renderSync(){
   const dot = $('#sync-dot'), st = $('#sync-status'), u = $('#sync-uid');
   if (!dot || !st || !u) return;
@@ -2302,15 +2474,14 @@ function renderSync(){
     u.textContent = 'Sync non disponible sur cet appareil';
     return;
   }
-  if (cloud.uid){
-    u.textContent = cloud.uid;
-    dot.className = 'sync-dot' + (cloud.connected ? ' on' : '');
-    st.textContent = cloud.connected ? 'Appareil identifié — en ligne' : 'Appareil identifié — reconnexion…';
-  } else {
-    u.textContent = 'Identification…';
-    dot.className = 'sync-dot';
-    st.textContent = 'Identification de l’appareil…';
-  }
+  u.textContent = cloud.uid || 'Identification…';
+  let on = false, txt;
+  if (!cloud.uid){ txt = 'Identification de l’appareil…'; }
+  else if (cloud.authorized === false){ txt = 'Cet appareil n’est pas membre d’une maisonnée'; }
+  else if (cloud.authorized === true){ on = cloud.connected; txt = cloud.connected ? 'Maisonnée synchronisée ✓' : 'Hors ligne — synchro en attente'; }
+  else { txt = cloud.connected ? 'Connexion à la maisonnée…' : 'Reconnexion…'; }
+  dot.className = 'sync-dot' + (on ? ' on' : '');
+  st.textContent = txt;
 }
 function initCloud(){
   if (typeof firebase === 'undefined' || !firebase || !firebase.initializeApp){ renderSync(); return; }
@@ -2320,7 +2491,11 @@ function initCloud(){
     cloud.auth = firebase.auth();
     cloud.db = firebase.database();
     renderSync();
-    cloud.auth.onAuthStateChanged(user => { cloud.uid = user ? user.uid : null; renderSync(); });
+    cloud.auth.onAuthStateChanged(user => {
+      cloud.uid = user ? user.uid : null;
+      renderSync();
+      if (user && !cloud.syncStarted){ cloud.syncStarted = true; startGrocerySync(); }
+    });
     cloud.auth.signInAnonymously().catch(() => { /* offline first run — SDK retries on reconnect */ });
     cloud.db.ref('.info/connected').on('value', snap => { cloud.connected = snap.val() === true; renderSync(); });
   } catch(e){ cloud.available = false; renderSync(); }
