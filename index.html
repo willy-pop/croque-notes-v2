@@ -1275,7 +1275,7 @@ function saveLocal(){
   catch(e){ /* storage unavailable (private mode, or sandboxed preview): keep working in-memory */ }
   renderStats();
 }
-function save(){ saveLocal(); pushGrocery(); pushPlan(); pushRecipes(); }  /* push* no-op until the household is synced */
+function save(){ saveLocal(); pushGrocery(); pushPlan(); pushRecipes(); pushAisle(); }  /* push* no-op until the household is synced */
 
 
 /* ================= navigation ================= */
@@ -2294,7 +2294,7 @@ const FB_CONFIG = {
   appId: '1:803730622999:web:7dd715d69b824aa6996a52'
 };
 const HOUSEHOLD_ID = 'chez-nous';
-const cloud = { available:false, uid:null, connected:false, authorized:null, auth:null, db:null, groceryRef:null, lastGrocery:null, planRef:null, lastPlan:null, recipesRef:null, lastRecipes:null, syncStarted:false };
+const cloud = { available:false, uid:null, connected:false, authorized:null, auth:null, db:null, groceryRef:null, lastGrocery:null, planRef:null, lastPlan:null, recipesRef:null, lastRecipes:null, aisleRef:null, lastAisle:null, syncStarted:false };
 
 /* ---- grocery sync (slice 1) — pure transforms, no Firebase needed (unit-tested) ----
    RTDB has no arrays, so a household's grocery lives as an id-keyed object
@@ -2366,6 +2366,7 @@ function startGrocerySync(){
       cloud.groceryRef.on('child_removed', s => removeRemoteG(s.key));
       startPlanSync();   /* chain plan sync once the household read is authorized */
       startRecipeSync();
+      startAisleSync();
     }, err => { cloud.authorized = false; renderSync(); });   /* permission denied → not a member; stay local-only */
   } catch(e){ cloud.authorized = false; renderSync(); }
 }
@@ -2545,6 +2546,54 @@ function startRecipeSync(){
       cloud.recipesRef.on('child_added',   s => applyRemoteR(s.key, s.val()));
       cloud.recipesRef.on('child_changed', s => applyRemoteR(s.key, s.val()));
       cloud.recipesRef.on('child_removed', s => removeRemoteR(s.key));
+    }, err => {});
+  } catch(e){}
+}
+
+/* ---- aisle-memory sync (slice 4) — flat { normalizedName: aisle } map ----
+   Keys are normalized ingredient names, which can hold RTDB-forbidden chars, so
+   they are escaped (escKey/unescKey) like the plan toggles. Values are plain aisle
+   strings. This only feeds future inferAisle() lookups, so remote changes update
+   the table without needing a re-render. */
+function aMapSer(m){ const o = {}; for (const k in m) o[escKey(k)] = m[k]; return o; }
+function pushAisle(){
+  if (!cloud.available || !cloud.authorized || !cloud.aisleRef) return;
+  try {
+    const cur = aMapSer(state.aisleMap);
+    const up = gDiff(cloud.lastAisle || {}, cur);
+    if (Object.keys(up).length) cloud.aisleRef.update(up).catch(() => {});
+    cloud.lastAisle = cur;
+  } catch(e){}
+}
+function applyRemoteA(ek, val){
+  if (cloud.lastAisle && cloud.lastAisle[ek] === val) return;   /* our own write echoing back */
+  state.aisleMap[unescKey(ek)] = val;
+  (cloud.lastAisle = cloud.lastAisle || {})[ek] = val;
+  saveLocal();
+}
+function removeRemoteA(ek){
+  const k = unescKey(ek);
+  if (!(k in state.aisleMap)){ if (cloud.lastAisle) delete cloud.lastAisle[ek]; return; }
+  delete state.aisleMap[k];
+  if (cloud.lastAisle) delete cloud.lastAisle[ek];
+  saveLocal();
+}
+function startAisleSync(){
+  try {
+    cloud.aisleRef = cloud.db.ref('cnv2/households/' + HOUSEHOLD_ID + '/aisleMap');
+    cloud.aisleRef.once('value', snap => {
+      const remoteSer = snap.val() || {};
+      const merged = {};
+      for (const ek in remoteSer) merged[unescKey(ek)] = remoteSer[ek];   /* remote wins */
+      const toPush = {};
+      for (const k in state.aisleMap){ if (!(escKey(k) in remoteSer)){ merged[k] = state.aisleMap[k]; toPush[escKey(k)] = state.aisleMap[k]; } }
+      state.aisleMap = merged;
+      cloud.lastAisle = aMapSer(state.aisleMap);
+      if (Object.keys(toPush).length) cloud.aisleRef.update(toPush).catch(() => {});
+      saveLocal();
+      cloud.aisleRef.on('child_added',   s => applyRemoteA(s.key, s.val()));
+      cloud.aisleRef.on('child_changed', s => applyRemoteA(s.key, s.val()));
+      cloud.aisleRef.on('child_removed', s => removeRemoteA(s.key));
     }, err => {});
   } catch(e){}
 }
